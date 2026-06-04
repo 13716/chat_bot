@@ -1,5 +1,5 @@
-import ChatWindow from "@/components/ChatWindow"
+import AgentChatWindow from "@/components/AgentChatWindow"
 
 export default function Home() {
-  return <ChatWindow />
+  return <AgentChatWindow />
 }

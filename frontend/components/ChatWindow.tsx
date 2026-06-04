@@ -7,6 +7,7 @@ import {
   updateConversationTitle, deleteConversationAPI
 } from "@/lib/api"
 import ProfileSettings from "@/components/ProfileSettings"
+import AccountingUpload from "./AccountingUpload"
 
 const SUGGESTED = [
   "Explain how RAG pipelines work",
@@ -27,6 +28,8 @@ export default function ChatWindow() {
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [hydrated, setHydrated] = useState(false)
   const [showProfile, setShowProfile] = useState(false)
+  const [streamingAccMsg, setStreamingAccMsg] = useState("")
+  const [isAccounting, setIsAccounting] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -34,7 +37,6 @@ export default function ChatWindow() {
   const active = conversations.find(c => c.id === activeId) ?? null
   const messages = active?.messages ?? []
 
-  // Load conversations từ DB khi khởi động
   useEffect(() => {
     fetchConversations().then(data => {
       setConversations(data)
@@ -92,7 +94,6 @@ export default function ChatWindow() {
     let currentId = activeId
     let isNewConv = false
 
-    // Tạo conversation mới nếu chưa có
     if (!currentId) {
       const conv = await createConversation(makeTitle(content))
       if (!conv) return
@@ -107,7 +108,6 @@ export default function ChatWindow() {
     setLoading(true)
     setShowScrollBtn(false)
 
-    // Cập nhật title nếu là tin nhắn đầu tiên
     const currentConv = conversations.find(c => c.id === currentId)
     if (!isNewConv && currentConv && currentConv.messages.length === 0) {
       const title = makeTitle(content)
@@ -115,7 +115,6 @@ export default function ChatWindow() {
       setConversations(prev => prev.map(c => c.id === currentId ? { ...c, title } : c))
     }
 
-    // Thêm messages vào local state
     setConversations(prev => prev.map(c =>
       c.id === currentId
         ? { ...c, messages: [...c.messages, userMsg, { role: "assistant", content: "" }] }
@@ -211,9 +210,12 @@ export default function ChatWindow() {
         .avatar { width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; margin-top: 2px; }
         .avatar-ai { background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.22); color: #60a5fa; }
         .avatar-user { background: rgba(139,92,246,0.12); border: 1px solid rgba(139,92,246,0.22); color: #a78bfa; }
-        .bubble { max-width: 68%; padding: 11px 15px; border-radius: 14px; font-size: 14px; line-height: 1.68; white-space: pre-wrap; word-break: break-word; }
+        .bubble { max-width: 68%; padding: 11px 15px; border-radius: 14px; font-size: 14px; line-height: 1.68; word-break: break-word; }
         .bubble-ai { background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.07); color: rgba(255,255,255,0.82); border-top-left-radius: 4px; }
-        .bubble-user { background: rgba(59,130,246,0.13); border: 1px solid rgba(59,130,246,0.18); color: rgba(255,255,255,0.88); border-top-right-radius: 4px; }
+        .bubble-user { background: rgba(59,130,246,0.13); border: 1px solid rgba(59,130,246,0.18); color: rgba(255,255,255,0.88); border-top-right-radius: 4px; white-space: pre-wrap; }
+        .bubble-ai strong { color: rgba(255,255,255,0.95); font-weight: 600; }
+        .bubble-ai p { margin-bottom: 10px; line-height: 1.7; }
+        .bubble-ai p:last-child { margin-bottom: 0; }
         .dots { display: flex; gap: 5px; align-items: center; height: 18px; }
         .dot { width: 5px; height: 5px; border-radius: 50%; background: rgba(255,255,255,0.28); animation: bounce 1.2s ease-in-out infinite; }
         .dot:nth-child(2){animation-delay:0.15s} .dot:nth-child(3){animation-delay:0.3s}
@@ -255,7 +257,6 @@ export default function ChatWindow() {
               </div>
             ))}
           </div>
-
           <button
             onClick={() => setShowProfile(true)}
             style={{
@@ -276,13 +277,16 @@ export default function ChatWindow() {
         <div className="chat-main">
           <div className="topbar">
             <div className="topbar-left">
-              <div className={`status-dot ${loading ? "thinking" : "online"}`}/>
+              <div className={`status-dot ${loading || isAccounting ? "thinking" : "online"}`}/>
               <span className="topbar-title">{active?.title ?? "Assistant"}</span>
-              <span className={`status-label ${loading ? "thinking" : ""}`}>{loading ? "thinking..." : "online"}</span>
+              <span className={`status-label ${loading || isAccounting ? "thinking" : ""}`}>
+                {loading || isAccounting ? "thinking..." : "online"}
+              </span>
             </div>
             <span className="model-badge">llama-3.1-8b · groq</span>
           </div>
 
+          {/* ── MESSAGES ── */}
           <div className="messages" ref={messagesRef} onScroll={handleScroll}>
             {messages.length === 0 ? (
               <div className="empty-state">
@@ -290,17 +294,34 @@ export default function ChatWindow() {
                 <div className="empty-title">Ready</div>
                 <div className="empty-sub">type something to begin</div>
                 <div className="suggestions">
-                  {SUGGESTED.map((s, i) => <button key={i} className="suggestion-chip" onClick={() => send(s)}>{s}</button>)}
+                  {SUGGESTED.map((s, i) => (
+                    <button key={i} className="suggestion-chip" onClick={() => send(s)}>{s}</button>
+                  ))}
                 </div>
               </div>
             ) : messages.map((m, i) => (
               <div key={i} className={`msg-row ${m.role === "user" ? "user" : ""}`}>
-                <div className={`avatar ${m.role === "assistant" ? "avatar-ai" : "avatar-user"}`}>{m.role === "assistant" ? "AI" : "U"}</div>
+                <div className={`avatar ${m.role === "assistant" ? "avatar-ai" : "avatar-user"}`}>
+                  {m.role === "assistant" ? "AI" : "U"}
+                </div>
                 <div className={`bubble ${m.role === "assistant" ? "bubble-ai" : "bubble-user"}`}>
-                  {m.role === "assistant" && m.content === "" && loading ? (
+                  {m.role === "assistant" && m.content === "" && (loading || isAccounting) ? (
                     <div className="dots"><div className="dot"/><div className="dot"/><div className="dot"/></div>
+                  ) : m.role === "assistant" ? (
+                    <>
+                      <span dangerouslySetInnerHTML={{
+                        __html: '<p>' + m.content
+                          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                          .replace(/\n\n/g, '</p><p>')
+                          .replace(/\n/g, '<br/>')
+                          + '</p>'
+                      }}/>
+                      {(loading || isAccounting) && i === messages.length - 1 && m.content !== "" && (
+                        <span className="cursor"/>
+                      )}
+                    </>
                   ) : (
-                    <>{m.content}{loading && i === messages.length - 1 && m.role === "assistant" && m.content !== "" && <span className="cursor"/>}</>
+                    <>{m.content}</>
                   )}
                 </div>
               </div>
@@ -308,20 +329,69 @@ export default function ChatWindow() {
             <div ref={bottomRef}/>
             {showScrollBtn && (
               <button className="scroll-btn" onClick={scrollToBottom}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <path d="M12 5v14M5 12l7 7 7-7"/>
+                </svg>
               </button>
             )}
           </div>
+          {/* ── END MESSAGES ── */}
 
+          {/* ── ACCOUNTING PANEL — đúng vị trí: sau messages, trước input ── */}
+          <AccountingUpload
+            disabled={loading || isAccounting}
+            onResult={async (userMsg, _) => {
+              let currentId = activeId
+              if (!currentId) {
+                const conv = await createConversation("Phân tích kế toán")
+                if (!conv) return
+                setConversations(prev => [conv, ...prev])
+                setActiveId(conv.id)
+                currentId = conv.id
+              }
+              setConversations(prev => prev.map(c =>
+                c.id === currentId
+                  ? { ...c, messages: [...c.messages,
+                      { role: "user", content: userMsg },
+                      { role: "assistant", content: "" }
+                    ]}
+                  : c
+              ))
+              setIsAccounting(true)
+              setStreamingAccMsg("")
+            }}
+            onStreaming={(token) => {
+              setStreamingAccMsg(prev => prev + token)
+              setConversations(prev => prev.map(c => {
+                if (c.id !== activeId) return c
+                const msgs = [...c.messages]
+                msgs[msgs.length - 1] = {
+                  role: "assistant",
+                  content: msgs[msgs.length - 1].content + token
+                }
+                return { ...c, messages: msgs }
+              }))
+            }}
+            onDone={() => {
+              setIsAccounting(false)
+              setStreamingAccMsg("")
+              inputRef.current?.focus()
+            }}
+          />
+
+          {/* ── INPUT AREA ── */}
           <div className="input-area">
             <div className="input-wrap">
-              <input ref={inputRef} className="chat-input"
+              <input
+                ref={inputRef}
+                className="chat-input"
                 placeholder={active ? "Message the assistant..." : "Start a new chat or type to begin..."}
-                value={input} onChange={e => setInput(e.target.value)}
+                value={input}
+                onChange={e => setInput(e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send() } }}
-                disabled={loading}
+                disabled={loading || isAccounting}
               />
-              <button className="send-btn" onClick={() => send()} disabled={loading || !input.trim()}>
+              <button className="send-btn" onClick={() => send()} disabled={loading || isAccounting || !input.trim()}>
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                   <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
                 </svg>

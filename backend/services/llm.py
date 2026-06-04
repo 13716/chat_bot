@@ -38,7 +38,10 @@ class LLMService:
         messages: list[dict],
         system: str,
     ) -> AsyncGenerator[str, None]:
-        if provider == "groq":
+        if provider == "deepseek":
+            async for token in self._deepseek(messages, system):
+                yield token
+        elif provider == "groq":
             async for token in self._groq(messages, system):
                 yield token
         elif provider == "gemini":
@@ -49,6 +52,25 @@ class LLMService:
                 yield token
         elif provider == "anthropic":
             async for token in self._anthropic(messages, system):
+                yield token
+
+    # ── Deepseek ──────────────────────────────────────────
+    async def _deepseek(self, messages, system) -> AsyncGenerator[str, None]:
+        if not settings.DEEPSEEK_API_KEY:
+            raise ValueError("No DEEPSEEK_API_KEY")
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(
+            api_key=settings.DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com",
+        )
+        stream = await client.chat.completions.create(
+            model=settings.DEEPSEEK_MODEL,
+            messages=[{"role": "system", "content": system}, *messages],
+            stream=True,
+        )
+        async for chunk in stream:
+            token = chunk.choices[0].delta.content or ""
+            if token:
                 yield token
 
     # ── Groq ──────────────────────────────────────────────
