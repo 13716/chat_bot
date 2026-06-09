@@ -2,10 +2,17 @@
 
 import { useState, useRef, useEffect, useCallback } from "react"
 import {
-  streamAgentChat, Message, ToolRequest, AgentMeta,
-  ModelInfo, FileAnalysis, getAgentModels, analyzeFile,
+  streamAgentChat, Message, ToolRequest, AgentMeta, Citation, FSRatio,
+  AgingSummary, ModelInfo, FileAnalysis, getAgentModels, analyzeFile,
 } from "@/lib/api"
 import ProfileSettings from "@/components/ProfileSettings"
+import dynamic from "next/dynamic"
+
+// Charts dùng browser API (recharts) → tải client-only, tránh SSR mismatch
+// Group components tự gọi rule engine (recommendCharts) để chọn loại chart phù hợp
+const AgingChartGroup = dynamic(() => import("@/components/AgentCharts").then(m => m.AgingChartGroup), { ssr: false })
+const VarianceChartGroup = dynamic(() => import("@/components/AgentCharts").then(m => m.VarianceChartGroup), { ssr: false })
+const FSChartGroup = dynamic(() => import("@/components/AgentCharts").then(m => m.FSChartGroup), { ssr: false })
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -24,6 +31,7 @@ interface ChatMessage {
   meta?: AgentMeta
   toolReq?: ToolRequest
   files?: { name: string; type: string }[]
+  citations?: Citation[]
 }
 
 interface Conversation {
@@ -41,8 +49,10 @@ const SUGGESTED = [
 ]
 
 const TOOL_LABELS: Record<string, string> = {
+  analyze_financial_statement: "Phân tích Báo cáo Tài chính",
   analyze_variance: "Phân tích Variance",
   bank_reconciliation: "Đối chiếu Ngân hàng",
+  ar_ap_aging: "Phân tích Tuổi Nợ AR/AP",
 }
 
 const FILE_ICONS: Record<string, string> = {
@@ -129,6 +139,7 @@ export default function AgentChatWindow() {
   const varianceFileRef = useRef<HTMLInputElement>(null)
   const bankFileRef = useRef<HTMLInputElement>(null)
   const bookFileRef = useRef<HTMLInputElement>(null)
+  const agingFileRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
@@ -287,15 +298,15 @@ export default function AgentChatWindow() {
 
   // ── Core: gọi tool với file cụ thể ──────────────────────────────────────
 
-  const runTool = async (req: ToolRequest, vf?: File, bf?: File, bkf?: File) => {
+  const runTool = async (req: ToolRequest, vf?: File, bf?: File, bkf?: File, agf?: File) => {
     const orig = messages.find(m => m.role === "user")?.content ?? ""
-    const names = [vf, bf, bkf].filter(Boolean).map(f => f!.name).join(", ")
+    const names = [vf, bf, bkf, agf].filter(Boolean).map(f => f!.name).join(", ")
     if (names) setMessages(prev => [...prev, { role: "user", content: `📎 ${names}` }])
 
     await streamAgentChat({
       message: orig, history: apiHistory(), modelId: selectedModel,
       outputFormat, pendingTool: req,
-      varianceFile: vf, bankFile: bf, bookFile: bkf,
+      varianceFile: vf, bankFile: bf, bookFile: bkf, agingFile: agf,
       onToolRequest: () => {},
       onMeta: (meta) => setMessages(prev => {
         const last = prev[prev.length - 1]
@@ -308,6 +319,7 @@ export default function AgentChatWindow() {
         if (varianceFileRef.current) varianceFileRef.current.value = ""
         if (bankFileRef.current) bankFileRef.current.value = ""
         if (bookFileRef.current) bookFileRef.current.value = ""
+        if (agingFileRef.current) agingFileRef.current.value = ""
         setLoading(false); inputRef.current?.focus()
       },
     })
@@ -354,7 +366,16 @@ export default function AgentChatWindow() {
       onToolRequest: async (req) => {
         setPendingTool(req)
 
-        // ── Nếu đã có file đính kèm → tự execute luôn, không hỏi ──
+        // ── Auto-execute: chỉ khi CÓ file Excel phù hợp ──────────────
+        // analyze_financial_statement: 1 Excel
+        if (req.name === "analyze_financial_statement" && excelFiles.length >= 1) {
+          setMessages(prev => [...prev, {
+            role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
+          }])
+          await runTool(req, excelFiles[0])
+          return
+        }
+        // analyze_variance: 1 Excel
         if (req.name === "analyze_variance" && excelFiles.length >= 1) {
           setMessages(prev => [...prev, {
             role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
@@ -362,6 +383,7 @@ export default function AgentChatWindow() {
           await runTool(req, excelFiles[0])
           return
         }
+        // bank_reconciliation: 2 Excel
         if (req.name === "bank_reconciliation" && excelFiles.length >= 2) {
           setMessages(prev => [...prev, {
             role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
@@ -369,8 +391,31 @@ export default function AgentChatWindow() {
           await runTool(req, undefined, excelFiles[0], excelFiles[1])
           return
         }
+        // ar_ap_aging: 1 Excel
+        if (req.name === "ar_ap_aging" && excelFiles.length >= 1) {
+          setMessages(prev => [...prev, {
+            role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
+          }])
+          await runTool(req, undefined, undefined, undefined, excelFiles[0])
+          return
+        }
 
-        // ── Chưa có file → hiện tool card để user upload ──
+        // ── Nếu tool bị trigger nhưng KHÔNG có Excel (VD: user upload doc/pdf) ──
+        // Bỏ qua tool request, không hiện card, để LLM tóm tắt file bình thường
+        if (
+          ["analyze_financial_statement","analyze_variance","bank_reconciliation","ar_ap_aging"].includes(req.name)
+          && excelFiles.length === 0
+        ) {
+          setPendingTool(null)
+          setLoading(false)
+          setMessages(prev => [...prev, {
+            role: "assistant",
+            content: `ℹ️ Tool **${TOOL_LABELS[req.name] ?? req.name}** yêu cầu file Excel (.xlsx). File bạn đính kèm không phải Excel nên tôi sẽ tóm tắt nội dung thay.`,
+          }])
+          return
+        }
+
+        // ── Chưa có file Excel → hiện tool card để user upload ──
         setMessages(prev => [...prev, {
           role: "tool_prompt",
           content: TOOL_LABELS[req.name] ?? req.name,
@@ -384,6 +429,11 @@ export default function AgentChatWindow() {
         if (last?.role === "assistant") return [...prev.slice(0, -1), { ...last, meta }]
         return [...prev, { role: "assistant", content: "", meta }]
       }),
+      onCitations: (citations) => setMessages(prev => {
+        const last = prev[prev.length - 1]
+        if (last?.role === "assistant") return [...prev.slice(0, -1), { ...last, citations }]
+        return prev
+      }),
       onToken: appendToken,
       onDone: () => { setLoading(false); inputRef.current?.focus() },
     })
@@ -394,19 +444,28 @@ export default function AgentChatWindow() {
   const executeTool = async () => {
     if (!pendingTool) return
     setLoading(true)
-    const vf = varianceFileRef.current?.files?.[0]
-    const bf = bankFileRef.current?.files?.[0]
+    const vf  = varianceFileRef.current?.files?.[0]
+    const bf  = bankFileRef.current?.files?.[0]
     const bkf = bookFileRef.current?.files?.[0]
+    const agf = agingFileRef.current?.files?.[0]
 
     if (pendingTool.name === "analyze_variance" && !vf) {
       setMessages(prev => [...prev, { role: "assistant", content: "⚠️ Vui lòng chọn file Excel." }])
+      setLoading(false); return
+    }
+    if (pendingTool.name === "analyze_financial_statement" && !vf) {
+      setMessages(prev => [...prev, { role: "assistant", content: "⚠️ Vui lòng chọn file Excel BCTC." }])
       setLoading(false); return
     }
     if (pendingTool.name === "bank_reconciliation" && (!bf || !bkf)) {
       setMessages(prev => [...prev, { role: "assistant", content: "⚠️ Cần cả 2 file." }])
       setLoading(false); return
     }
-    await runTool(pendingTool, vf, bf, bkf)
+    if (pendingTool.name === "ar_ap_aging" && !agf) {
+      setMessages(prev => [...prev, { role: "assistant", content: "⚠️ Vui lòng chọn file Excel danh sách công nợ." }])
+      setLoading(false); return
+    }
+    await runTool(pendingTool, vf, bf, bkf, agf)
   }
 
   const currentModel = models.find(m => m.id === selectedModel)
@@ -645,6 +704,60 @@ export default function AgentChatWindow() {
           color:#2563eb;cursor:pointer;font-family:'Inter',sans-serif;transition:all .15s}
         .ag-tool-suggest-btn:hover{background:linear-gradient(135deg,#2563eb,#3b82f6);color:white}
 
+        /* FS ratio badges */
+        .ag-ratios{display:flex;flex-wrap:wrap;gap:5px;padding:6px 14px 10px}
+        .ag-ratio-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
+          border-radius:8px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:500}
+        .ag-ratio-good{background:#f0fdf4;border:1px solid #86efac;color:#15803d}
+        .ag-ratio-warning{background:#fffbeb;border:1px solid #fcd34d;color:#b45309}
+        .ag-ratio-critical{background:#fef2f2;border:1px solid #fca5a5;color:#dc2626}
+        .ag-ratio-info{background:#eff6ff;border:1px solid #93c5fd;color:#2563eb}
+        .ag-ratio-val{font-weight:700}
+
+        /* Aging card */
+        .ag-aging-card{padding:10px 14px 6px;border-top:1px solid #e8f0fe}
+        .ag-aging-title{font-size:11px;font-weight:700;color:#1d4ed8;margin-bottom:7px;
+          font-family:'JetBrains Mono',monospace;letter-spacing:.04em}
+        .ag-aging-table{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:8px}
+        .ag-aging-table th{background:linear-gradient(135deg,#eff6ff,#dbeafe);
+          border:1px solid #bfdbfe;padding:5px 8px;color:#1d4ed8;font-weight:600;text-align:left}
+        .ag-aging-table td{border:1px solid #e2e8f0;padding:5px 8px;color:#1e3a5f}
+        .ag-aging-table tr:nth-child(even) td{background:#f8fbff}
+        .ag-aging-current td{color:#15803d}
+        .ag-aging-warn td{color:#b45309;background:#fffbeb!important}
+        .ag-aging-danger td{color:#dc2626;background:#fef2f2!important;font-weight:600}
+        .ag-aging-risk{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;
+          border-radius:20px;font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace}
+        .ag-aging-risk-low{background:#f0fdf4;border:1px solid #86efac;color:#15803d}
+        .ag-aging-risk-medium{background:#fffbeb;border:1px solid #fcd34d;color:#b45309}
+        .ag-aging-risk-high{background:#fef3c7;border:1px solid #f59e0b;color:#92400e}
+        .ag-aging-risk-critical{background:#fef2f2;border:1px solid #fca5a5;color:#dc2626}
+        .ag-aging-reasons{margin-top:6px;font-size:11px;color:#4b6a8f;line-height:1.7}
+
+        /* Recharts chart cards */
+        .ag-chart-card{padding:10px 8px 8px 4px;border-top:1px solid #e8f0fe;margin-top:2px}
+        .ag-chart-title{font-size:11px;font-weight:700;color:#1d4ed8;margin:0 0 8px 10px;
+          font-family:'JetBrains Mono',monospace;letter-spacing:.04em}
+        .ag-chart-legend{display:flex;gap:14px;justify-content:center;margin-top:6px;
+          font-size:10px;color:#64748b;font-family:'JetBrains Mono',monospace}
+        .ag-chart-legend span{display:inline-flex;align-items:center;gap:5px}
+        .ag-chart-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+        .ag-chart-reco{margin:8px 10px 2px;padding:5px 10px;border-radius:8px;
+          background:linear-gradient(135deg,#eef6ff,#e0edff);border:1px solid #cfe0f5;
+          font-size:10.5px;color:#2563eb;font-family:'JetBrains Mono',monospace;
+          letter-spacing:.02em;display:inline-block}
+
+        /* Citation badges */
+        .ag-citations{display:flex;flex-wrap:wrap;gap:5px;padding:6px 14px 10px}
+        .ag-cite-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;
+          border-radius:20px;font-size:11px;font-family:'JetBrains Mono',monospace;
+          font-weight:500;border:1px solid #bfdbfe;
+          background:linear-gradient(135deg,#eff6ff,#e0edff);color:#2563eb;
+          cursor:default;transition:all .15s}
+        .ag-cite-badge:hover{background:linear-gradient(135deg,#dbeafe,#bfdbfe);
+          box-shadow:0 1px 4px rgba(37,99,235,.15)}
+        .ag-cite-score{font-size:9px;color:#93c5fd;margin-left:3px}
+
         /* INPUT AREA */
         .ag-input-area{flex-shrink:0;
           background:linear-gradient(180deg,#f5f9ff,#ffffff);
@@ -827,6 +940,16 @@ export default function AgentChatWindow() {
                           ? "Upload file Excel Budget vs Actual (P&L) để phân tích."
                           : "Upload 2 file: sao kê ngân hàng và sổ sách kế toán."}
                       </div>
+                      {msg.toolReq.name === "analyze_financial_statement" && (
+                        <div>
+                          <div className="ag-tool-hint">
+                            Upload file Excel BCTC (Bảng CĐKT + KQKD). File cần có các dòng:
+                            Tổng tài sản, Nợ phải trả, Vốn chủ sở hữu, Doanh thu thuần, Lợi nhuận sau thuế.
+                          </div>
+                          <div className="ag-file-lbl">File Excel BCTC (.xlsx)</div>
+                          <input ref={varianceFileRef} type="file" accept=".xlsx,.xls,.csv" disabled={loading} className="ag-tool-finput"/>
+                        </div>
+                      )}
                       {msg.toolReq.name === "analyze_variance" && (
                         <div>
                           <div className="ag-file-lbl">File Excel (Budget vs Actual)</div>
@@ -843,6 +966,15 @@ export default function AgentChatWindow() {
                           <input ref={bookFileRef} type="file" accept=".xlsx,.xls" disabled={loading} className="ag-tool-finput"/>
                         </div>
                       </>)}
+                      {msg.toolReq.name === "ar_ap_aging" && (
+                        <div>
+                          <div className="ag-tool-hint">
+                            Upload file Excel danh sách công nợ. Cần có cột: Khách hàng/Vendor, Số tiền, Ngày đến hạn (hoặc Ngày hóa đơn).
+                          </div>
+                          <div className="ag-file-lbl">File Excel công nợ AR/AP (.xlsx)</div>
+                          <input ref={agingFileRef} type="file" accept=".xlsx,.xls" disabled={loading} className="ag-tool-finput"/>
+                        </div>
+                      )}
                       <button className="ag-tool-submit" onClick={executeTool} disabled={loading}>
                         {loading ? "Đang phân tích…" : "Phân tích ngay →"}
                       </button>
@@ -883,6 +1015,31 @@ export default function AgentChatWindow() {
                       <RichMessage content={msg.content} isStreaming={loading && i === messages.length - 1} outputFormat={outputFormat}/>
                     )}
                     {msg.meta && <MetaTags meta={msg.meta}/>}
+                    {msg.meta?.ratios && msg.meta.ratios.length > 0 && (
+                      <>
+                        <RatioTags ratios={msg.meta.ratios}/>
+                        <FSChartGroup ratios={msg.meta.ratios}/>
+                      </>
+                    )}
+                    {msg.meta?.aging_summary && (
+                      <>
+                        <AgingCard summary={msg.meta.aging_summary}/>
+                        <AgingChartGroup summary={msg.meta.aging_summary}/>
+                      </>
+                    )}
+                    {msg.meta?.flagged_items && msg.meta.flagged_items.length > 0 && (
+                      <VarianceChartGroup items={msg.meta.flagged_items}/>
+                    )}
+                    {msg.citations && msg.citations.length > 0 && (
+                      <div className="ag-citations">
+                        {msg.citations.map((c, ci) => (
+                          <span key={ci} className="ag-cite-badge" title={c.article_title}>
+                            {c.label}
+                            <span className="ag-cite-score">{Math.round(c.score * 100)}%</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               )
@@ -1066,6 +1223,106 @@ function MetaTags({ meta }: { meta: AgentMeta }) {
         <span className="ag-tag ag-tag-err">✗ NH: {meta.summary.unmatched_bank}</span>
         <span className="ag-tag ag-tag-err">✗ SS: {meta.summary.unmatched_book}</span>
       </>}
+      {meta.critical_count !== undefined && <>
+        {meta.period && <span className="ag-tag ag-tag-info">📅 {meta.period}</span>}
+        {meta.critical_count > 0
+          ? <span className="ag-tag ag-tag-err">🔴 {meta.critical_count} critical</span>
+          : <span className="ag-tag ag-tag-ok">✅ Không có chỉ số critical</span>}
+        {meta.warning_count !== undefined && meta.warning_count > 0 &&
+          <span className="ag-tag ag-tag-warn">⚠ {meta.warning_count} warning</span>}
+      </>}
+      {meta.aging_summary && <>
+        <span className="ag-tag ag-tag-info">📋 {meta.invoice_count ?? 0} hóa đơn</span>
+        <span className="ag-tag ag-tag-info">
+          💰 {(meta.aging_summary.total_outstanding / 1e6).toFixed(1)}M đ
+        </span>
+        <span className={`ag-tag ag-tag-${
+          meta.aging_summary.risk_level === "LOW" ? "ok" :
+          meta.aging_summary.risk_level === "MEDIUM" ? "warn" : "err"
+        }`}>
+          {meta.aging_summary.risk_level === "LOW" ? "✅" :
+           meta.aging_summary.risk_level === "MEDIUM" ? "⚠️" : "🔴"} Risk: {meta.aging_summary.risk_level}
+        </span>
+      </>}
+    </div>
+  )
+}
+
+// ── Aging bucket card ──────────────────────────────────────────────────────
+
+function AgingCard({ summary }: { summary: AgingSummary }) {
+  const BUCKET_ORDER = ["current", "1_30", "31_60", "61_90", "over_90"]
+  const RISK_CLASS: Record<string, string> = {
+    LOW: "ag-aging-risk-low", MEDIUM: "ag-aging-risk-medium",
+    HIGH: "ag-aging-risk-high", CRITICAL: "ag-aging-risk-critical",
+  }
+  const ROW_CLASS: Record<string, string> = {
+    current: "ag-aging-current",
+    "1_30": "", "31_60": "ag-aging-warn",
+    "61_90": "ag-aging-warn", over_90: "ag-aging-danger",
+  }
+
+  const fmtAmt = (v: number) =>
+    v >= 1e9 ? `${(v/1e9).toFixed(2)} tỷ` : v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : `${v.toLocaleString()}`
+
+  return (
+    <div className="ag-aging-card">
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+        <span className="ag-aging-title">📊 AGING REPORT — {summary.as_of}</span>
+        <span className={`ag-aging-risk ${RISK_CLASS[summary.risk_level]}`}>
+          {summary.risk_level === "LOW" ? "✅" : summary.risk_level === "MEDIUM" ? "⚠️" : "🔴"} {summary.risk_level}
+        </span>
+        <span style={{fontSize:11,color:"#7096be",fontFamily:"'JetBrains Mono',monospace"}}>
+          Tổng: {fmtAmt(summary.total_outstanding)}
+        </span>
+      </div>
+      <table className="ag-aging-table">
+        <thead>
+          <tr>
+            <th>Nhóm tuổi nợ</th>
+            <th style={{textAlign:"right"}}>Số HĐ</th>
+            <th style={{textAlign:"right"}}>Số tiền</th>
+            <th style={{textAlign:"right"}}>Tỷ lệ</th>
+          </tr>
+        </thead>
+        <tbody>
+          {BUCKET_ORDER.map(key => {
+            const b = summary.buckets[key]
+            if (!b) return null
+            return (
+              <tr key={key} className={ROW_CLASS[key] ?? ""}>
+                <td>{b.label}</td>
+                <td style={{textAlign:"right"}}>{b.count}</td>
+                <td style={{textAlign:"right"}}>{fmtAmt(b.amount)}</td>
+                <td style={{textAlign:"right"}}>{b.pct}%</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+      {summary.risk_reasons.length > 0 && (
+        <div className="ag-aging-reasons">
+          {summary.risk_reasons.map((r, i) => <div key={i}>{r}</div>)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── FS Ratio badges ────────────────────────────────────────────────────────
+
+function RatioTags({ ratios }: { ratios: FSRatio[] }) {
+  const STATUS_ICONS: Record<string, string> = {
+    good: "✅", warning: "⚠️", critical: "🔴", info: "ℹ️",
+  }
+  return (
+    <div className="ag-ratios">
+      {ratios.map((r, i) => (
+        <span key={i} className={`ag-ratio-badge ag-ratio-${r.status}`} title={r.label}>
+          {STATUS_ICONS[r.status]} {r.key.toUpperCase().replace(/_/g, " ")}:&nbsp;
+          <span className="ag-ratio-val">{r.value}{r.unit}</span>
+        </span>
+      ))}
     </div>
   )
 }

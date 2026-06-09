@@ -1,4 +1,53 @@
-venv
-.env*
+# ── Dependencies ──
+venv/
+node_modules/
 __pycache__/
-*.pyc   
+*.pyc
+
+# ── Environment / Secrets ──
+.env*
+*sk-*.txt
+deepseek*.txt
+*api*key*.txt
+
+# ── Next.js / build output ──
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# ── Logs ──
+*.log
+logs/
+backend/logs/
+
+# ── Data lớn (PDF nguồn 249MB, raw text, checkpoint ingestion) ──
+data/*.pdf
+data/*_raw.txt
+data/checkpoints/
+backend/data/checkpoints/
+
+# ── Editor / local config ──
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# ── Data: log/ảnh ingestion tạm (giữ sample .xlsx) ──
+data/ingest_*.txt
+data/*.png
+ingest_*.txt
+
+# ── Plugin marketplace bên thứ 3 (giải nén nhầm vào repo) ──
+knowledge-work-plugins-main/
+*.zip
+
+# ── File rác / test tạm ──
+~$*
+*.webp
+-w
+/bank.xlsx
+/book.xlsx
+backend/test_variance.xlsx
+backend/_*.py

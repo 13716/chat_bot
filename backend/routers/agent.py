@@ -6,6 +6,7 @@ GET  /agent/models
 GET  /agent/health
 """
 
+import asyncio
 import json
 import os
 import tempfile
@@ -23,6 +24,14 @@ from services.accounting import (
     flag_variance, parse_excel_bank, parse_excel_variance, reconcile_bank,
 )
 from services.file_analyzer import analyze_file
+from services.aging import (
+    build_aging_prompt, parse_excel_aging, summarize_aging,
+)
+from services.financial_statement import (
+    build_fs_prompt, compute_ratios, flag_ratios, parse_excel_fs,
+)
+from services.rag.intent import detect_intent
+from services.rag.retriever import format_citations, format_context, retrieve
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 settings = get_settings()
@@ -44,15 +53,33 @@ _TOOL_GUIDE = """
 
 ## CÔNG CỤ PHÂN TÍCH (Tools)
 
-Bạn có các công cụ chuyên biệt sau. Khi user yêu cầu phân tích số liệu từ file, **hãy chủ động gọi tool phù hợp** thay vì trả lời chung chung:
+### NGUYÊN TẮC QUAN TRỌNG — ĐỌC TRƯỚC KHI GỌI TOOL
+
+❌ **KHÔNG GỌI BẤT KỲ TOOL NÀO** khi:
+- User chỉ yêu cầu **tóm tắt**, **đọc**, **xem qua**, **review** file (dù file là Excel hay Word hay PDF)
+- User hỏi câu hỏi mà không đề cập rõ ràng đến việc phân tích số liệu
+- File đính kèm là **Word (.doc/.docx)**, **PDF thông thường**, **text**, **ảnh** — những file này dùng để đọc, không phải để chạy tool kế toán
+- User chỉ muốn **chat**, **hỏi đáp** hoặc **giải thích khái niệm**
+
+✅ **CHỈ GỌI TOOL** khi:
+- File đính kèm là **Excel (.xlsx/.xls)** VÀ user rõ ràng yêu cầu phân tích số liệu
+- User dùng từ khóa cụ thể như: "phân tích variance", "đối chiếu ngân hàng", "tính ROE ROA", "phân tích BCTC"
+
+---
+
+### analyze_financial_statement
+Gọi KHI VÀ CHỈ KHI user muốn **tính toán tỷ số tài chính** từ file Excel BCTC:
+- Tính ROE, ROA, Current Ratio, Quick Ratio, Debt/Equity, Gross Margin, Net Margin
+- Đánh giá sức khỏe tài chính, so sánh với ngưỡng chuẩn
+- File PHẢI là Excel có dữ liệu CĐKT và KQKD
+- Từ khóa kích hoạt: "tính ROE", "phân tích tỷ số tài chính", "đánh giá sức khỏe tài chính", "phân tích BCTC"
+- ❌ KHÔNG gọi nếu user chỉ nói "tóm tắt file", "xem file", "file này nói gì"
 
 ### analyze_variance
-Gọi khi user muốn:
-- Phân tích chênh lệch thực tế vs kế hoạch / ngân sách (variance analysis)
-- So sánh Actual vs Budget trên P&L, báo cáo kết quả kinh doanh
-- Viết commentary variance cho ban lãnh đạo / CFO
-- Tìm khoản mục vượt ngưỡng, giải thích nguyên nhân chênh lệch
-- Từ khóa kích hoạt: variance, chênh lệch, thực tế vs kế hoạch, budget, actual, P&L
+Gọi KHI VÀ CHỈ KHI user muốn **phân tích chênh lệch Actual vs Budget**:
+- File Excel có cột Budget, Actual
+- Từ khóa: "variance", "chênh lệch ngân sách", "thực tế vs kế hoạch", "actual vs budget"
+- ❌ KHÔNG gọi nếu user chỉ nói "tóm tắt", "xem qua" file
 
 ### bank_reconciliation
 Gọi khi user muốn:
@@ -63,6 +90,15 @@ Gọi khi user muốn:
 - Từ khóa kích hoạt: bank reconciliation, đối chiếu ngân hàng, sao kê, reconcile
 
 **Lưu ý**: Khi không có file Excel nhưng user yêu cầu → hỏi upload file trước khi gọi tool.
+
+### ar_ap_aging
+Gọi khi user muốn phân tích tuổi nợ (aging analysis):
+- Phân loại công nợ theo nhóm: Chưa đến hạn, 1-30, 31-60, 61-90, >90 ngày
+- Đánh giá rủi ro thu hồi nợ / rủi ro thanh toán
+- Tìm đối tác/khách hàng có nợ quá hạn lâu nhất
+- Phân tích AR (Phải Thu) hoặc AP (Phải Trả)
+- Từ khóa kích hoạt: aging, tuổi nợ, công nợ phải thu, công nợ phải trả, AR aging, AP aging,
+  nợ quá hạn, overdue, phân tích công nợ, danh sách công nợ
 """
 
 SYSTEM_PROMPT = _BASE_PROMPT + _TOOL_GUIDE
@@ -139,6 +175,31 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_financial_statement",
+            "description": (
+                "UC#1 — Tính toán tỷ số tài chính (ROE, ROA, Current Ratio, Quick Ratio, Debt/Equity, "
+                "Gross Margin, Net Margin) từ file Excel BCTC và viết báo cáo phân tích sức khỏe tài chính. "
+                "CHỈ GỌI TOOL NÀY khi: (1) file đính kèm là Excel, VÀ (2) user rõ ràng yêu cầu TÍNH TỶ SỐ "
+                "hoặc PHÂN TÍCH SỨC KHỎE TÀI CHÍNH — ví dụ: 'tính ROE', 'phân tích tỷ số tài chính', "
+                "'đánh giá sức khỏe tài chính doanh nghiệp'. "
+                "KHÔNG GỌI TOOL NÀY khi: user chỉ muốn tóm tắt file, xem nội dung file, "
+                "file không phải Excel (Word/PDF/ảnh), hoặc user không đề cập đến tỷ số tài chính cụ thể."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "description": "Kỳ báo cáo, VD: 'Năm 2025', 'Q4 2025', 'H1 2026'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "bank_reconciliation",
             "description": (
                 "UC#5 — Đối chiếu sao kê ngân hàng với sổ sách kế toán, dùng fuzzy matching để tìm giao dịch "
@@ -153,6 +214,38 @@ TOOLS = [
                     "fuzzy_threshold": {
                         "type": "integer",
                         "description": "Ngưỡng độ tương đồng tên vendor khi fuzzy match (0–100). Mặc định 85. Giảm xuống 70 nếu tên vendor có nhiều biến thể.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ar_ap_aging",
+            "description": (
+                "UC#7 — Phân tích tuổi nợ AR/AP (Aging Analysis). Phân loại công nợ phải thu/phải trả "
+                "theo nhóm thời gian: Chưa đến hạn, 1-30, 31-60, 61-90, >90 ngày. Đánh giá rủi ro, "
+                "xác định đối tác có nợ quá hạn, viết commentary cảnh báo bằng tiếng Việt. "
+                "GỌI TOOL NÀY khi user đề cập: aging, tuổi nợ, công nợ phải thu, công nợ phải trả, "
+                "AR aging, AP aging, nợ quá hạn, overdue, phân tích công nợ, danh sách công nợ."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ar_type": {
+                        "type": "string",
+                        "enum": ["AR", "AP", "both"],
+                        "description": "Loại công nợ cần phân tích: AR (Phải Thu), AP (Phải Trả), both (cả hai). Mặc định 'both'.",
+                    },
+                    "payment_terms_days": {
+                        "type": "integer",
+                        "description": "Số ngày thanh toán mặc định nếu file không có cột due_date (VD: 30, 45, 60). Mặc định 30.",
+                    },
+                    "as_of_date": {
+                        "type": "string",
+                        "description": "Ngày tính aging, định dạng YYYY-MM-DD. Mặc định hôm nay.",
                     },
                 },
                 "required": [],
@@ -181,10 +274,141 @@ async def _run_variance(tmp: str, period, threshold) -> dict:
     flagged = flag_variance(rows, threshold=threshold)
     fc = sum(1 for r in flagged if r["flagged"])
     logger.info(f"Variance: {fc}/{len(rows)} flagged")
+
+    # Chart data: các khoản vượt ngưỡng, sort theo |variance_abs| giảm dần, cap 12 để chart gọn
+    chart_items = sorted(
+        (r for r in flagged if r["flagged"] and r.get("variance_abs") is not None),
+        key=lambda r: abs(r["variance_abs"]),
+        reverse=True,
+    )[:12]
+    flagged_items = [
+        {
+            "item":         r["item"],
+            "budget":       r.get("budget"),
+            "actual":       r.get("actual"),
+            "variance_abs": r.get("variance_abs"),
+            "variance_pct": r.get("variance_pct"),
+            "line_type":    r.get("line_type", "expense"),
+            "direction":    r.get("direction", ""),
+        }
+        for r in chart_items
+    ]
+
     return {
         "prompt": build_variance_prompt(flagged, period=period, threshold=threshold),
-        "meta": {"total_rows": len(rows), "flagged_count": fc, "threshold": threshold, "period": period},
+        "meta": {
+            "total_rows": len(rows),
+            "flagged_count": fc,
+            "threshold": threshold,
+            "period": period,
+            "flagged_items": flagged_items,
+        },
     }
+
+async def _run_fs(tmp: str, period) -> dict:
+    data, val = parse_excel_fs(tmp)
+    if not val.is_valid:
+        raise HTTPException(422, "; ".join(e.message for e in val.errors))
+    ratios = compute_ratios(data)
+    flagged = flag_ratios(ratios)
+    critical = sum(1 for f in flagged if f["status"] == "critical")
+    warning  = sum(1 for f in flagged if f["status"] == "warning")
+    logger.info(f"FS: {len(flagged)} ratios, {critical} critical, {warning} warning")
+    return {
+        "prompt": build_fs_prompt(data, ratios, flagged, period=period),
+        "meta": {
+            "ratios": flagged,
+            "critical_count": critical,
+            "warning_count": warning,
+            "period": period,
+        },
+    }
+
+
+async def _run_aging(tmp: str, ar_type: str, payment_terms: int, as_of_date_str: Optional[str]) -> dict:
+    from datetime import date as _date
+    as_of = None
+    if as_of_date_str:
+        try:
+            from datetime import datetime as _dt
+            as_of = _dt.strptime(as_of_date_str, "%Y-%m-%d").date()
+        except Exception:
+            pass
+
+    rows, val = parse_excel_aging(tmp, as_of=as_of, payment_terms_days=payment_terms)
+    if not val.is_valid:
+        raise HTTPException(422, "; ".join(e.message for e in val.errors))
+
+    # Filter theo loại nếu cần
+    if ar_type in ("AR", "AP"):
+        filtered = [r for r in rows if r["ar_type"] == ar_type or r["ar_type"] == "unknown"]
+    else:
+        filtered = rows
+
+    summary = summarize_aging(filtered)
+    label_map = {"AR": "Công nợ Phải Thu (AR)", "AP": "Công nợ Phải Trả (AP)", "both": "Công nợ AR/AP"}
+    label = label_map.get(ar_type, "Công nợ")
+
+    logger.info(
+        f"Aging: {len(rows)} invoices, total={summary.get('total_outstanding',0):,.0f}, "
+        f"risk={summary.get('risk_level','?')}"
+    )
+    return {
+        "prompt": build_aging_prompt(summary, label),
+        "meta": {
+            "aging_summary": summary,
+            "ar_type": ar_type,
+            "invoice_count": len(rows),
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RULE-BASED TOOL SELECTOR
+# Llama trên Groq hay sinh tool-call sai định dạng (tool_use_failed). Khi đã biết
+# intent=tool (vd Excel đính kèm), chọn tool theo luật → nhanh + chắc chắn,
+# không phụ thuộc khả năng tool-calling kém ổn định của LLM.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm_msg(text: str) -> str:
+    import unicodedata
+    s = (text or "").lower().replace("đ", "d")
+    s = unicodedata.normalize("NFD", s)
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+_KW_BANK     = ["doi chieu", "reconcil", "sao ke", "bank statement"]
+_KW_AGING    = ["tuoi no", "aging", "cong no", "no qua han", "phai thu", "phai tra", "overdue"]
+_KW_VARIANCE = ["chenh lech", "variance", "ke hoach", "budget", "vuot nguong",
+                "thuc te vs", "actual vs", "ngan sach", "du toan"]
+_KW_FS       = ["bao cao tai chinh", "bctc", "tai chinh", "ty so", "chi so tai chinh",
+                "roe", "roa", "thanh khoan", "bien loi nhuan", "can doi ke toan", "kqkd"]
+
+
+def _select_tool_by_rules(message: str, excel_count: int) -> Optional[dict]:
+    """Chọn tool theo từ khóa + số file Excel. Trả {name, arguments} hoặc None."""
+    n = _norm_msg(message)
+
+    # Bank reconciliation: cần đối chiếu 2 nguồn → keyword hoặc có >=2 file Excel
+    if any(k in n for k in _KW_BANK) or excel_count >= 2:
+        return {"name": "bank_reconciliation", "arguments": {}}
+
+    if any(k in n for k in _KW_AGING):
+        ar_type = "AR" if "phai thu" in n else ("AP" if "phai tra" in n else "both")
+        return {"name": "ar_ap_aging", "arguments": {"ar_type": ar_type}}
+
+    if any(k in n for k in _KW_VARIANCE):
+        return {"name": "analyze_variance", "arguments": {}}
+
+    if any(k in n for k in _KW_FS):
+        return {"name": "analyze_financial_statement", "arguments": {}}
+
+    # Có đúng 1 file Excel nhưng câu mơ hồ → mặc định phân tích BCTC
+    if excel_count == 1:
+        return {"name": "analyze_financial_statement", "arguments": {}}
+
+    return None
+
 
 async def _run_bank_recon(bank_tmp, book_tmp, fuzzy) -> dict:
     bank_rows, bv = parse_excel_bank(bank_tmp)
@@ -232,6 +456,7 @@ async def agent_chat(
     variance_file: Optional[UploadFile] = File(None),
     bank_file: Optional[UploadFile] = File(None),
     book_file: Optional[UploadFile] = File(None),
+    aging_file: Optional[UploadFile] = File(None),
     pending_tool: Optional[str] = Form(None),
 ):
     mid = model_id or _default_model_id()
@@ -258,12 +483,17 @@ async def agent_chat(
         except Exception:
             raise HTTPException(400, "pending_tool phải là JSON")
 
-        tool_name = tc.get("name"); tool_args = tc.get("arguments", {}); tc_id = tc.get("id", "call_0")
+        tool_name = tc.get("name"); tool_args = tc.get("arguments") or {}; tc_id = tc.get("id", "call_0")
         tmps: list[str] = []
         tool_result = ""; tool_meta: dict = {}
 
         try:
-            if tool_name == "analyze_variance":
+            if tool_name == "analyze_financial_statement":
+                if not variance_file: raise HTTPException(400, "Cần fs_file (gửi qua variance_file)")
+                p = await _save_temp(variance_file); tmps.append(p)
+                r = await _run_fs(p, tool_args.get("period"))
+                tool_result = r["prompt"]; tool_meta = r["meta"]
+            elif tool_name == "analyze_variance":
                 if not variance_file: raise HTTPException(400, "Cần variance_file")
                 p = await _save_temp(variance_file); tmps.append(p)
                 r = await _run_variance(p, tool_args.get("period"), float(tool_args.get("threshold", 0.15)))
@@ -273,6 +503,16 @@ async def agent_chat(
                 bp = await _save_temp(bank_file); bkp = await _save_temp(book_file)
                 tmps.extend([bp, bkp])
                 r = await _run_bank_recon(bp, bkp, int(tool_args.get("fuzzy_threshold", 85)))
+                tool_result = r["prompt"]; tool_meta = r["meta"]
+            elif tool_name == "ar_ap_aging":
+                if not aging_file: raise HTTPException(400, "Cần aging_file (file Excel danh sách công nợ)")
+                p = await _save_temp(aging_file); tmps.append(p)
+                r = await _run_aging(
+                    p,
+                    tool_args.get("ar_type", "both"),
+                    int(tool_args.get("payment_terms_days", 30)),
+                    tool_args.get("as_of_date"),
+                )
                 tool_result = r["prompt"]; tool_meta = r["meta"]
             else:
                 raise HTTPException(400, f"Unknown tool: {tool_name}")
@@ -300,6 +540,37 @@ async def agent_chat(
         return StreamingResponse(gen_tool(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+    # ── RAG augmentation (chỉ cho câu hỏi pháp lý) ──────────────────────
+    rag_chunks: list[dict] = []
+    intent = detect_intent(message)
+
+    # File Excel đính kèm → ép intent=tool, NHƯNG chỉ khi câu hỏi mơ hồ (general).
+    # Tôn trọng phân loại rõ ràng:
+    #   - intent=legal (vd "đúng pháp lý chưa", "theo thông tư") → giữ RAG, KHÔNG ép
+    #   - intent=tool  (vd "phân tích báo cáo tài chính")        → vốn đã là tool
+    # File Word/PDF KHÔNG ép → giữ guard tóm tắt cũ.
+    has_excel = any((af.filename or "").lower().endswith((".xlsx", ".xls")) for af in attached_files)
+    if has_excel and tool_capable and intent == "general":
+        logger.info("Excel đính kèm + câu mơ hồ → ép intent='tool'")
+        intent = "tool"
+
+    if intent == "legal":
+        rag_chunks = await asyncio.to_thread(retrieve, message)
+        if rag_chunks:
+            sys_prompt = sys_prompt + format_context(rag_chunks)
+            logger.info(f"RAG augmented: {len(rag_chunks)} chunks, intent=legal")
+        else:
+            # Không tìm thấy trong DB → cảnh báo LLM không được bịa citation
+            sys_prompt = sys_prompt + (
+                "\n\n---\n"
+                "⚠️ LƯU Ý QUAN TRỌNG: Cơ sở dữ liệu pháp lý nội bộ KHÔNG có thông tin về câu hỏi này "
+                "(có thể điều khoản này chưa được nạp vào hệ thống).\n"
+                "Hãy trả lời dựa trên kiến thức chung về kế toán Việt Nam (VAS, TT200/2014, TT133/2016) "
+                "và BẮT BUỘC thêm ghi chú cuối câu trả lời:\n"
+                "**📌 Lưu ý: Câu trả lời này dựa trên kiến thức chung, chưa được xác minh từ cơ sở dữ liệu pháp lý nội bộ.**"
+            )
+            logger.info(f"RAG: 0 chunks — disclaimer added, intent=legal")
+
     # ── Build user message (có thể kèm file context) ────────────────────
     user_content = message
 
@@ -322,9 +593,30 @@ async def agent_chat(
         {"role": "user", "content": user_content},
     ]
 
-    # ── Gọi LLM với tool-calling nếu model hỗ trợ ──────────────────────
+    # ── Gọi LLM ──────────────────────────────────────────────────────────
+    # Tool-calling CHỈ khi intent="tool" — legal/general stream thẳng không qua tool loop
+    # Lý do: câu hỏi pháp lý/chung chung không cần tool, tránh LLM nhầm gọi tool sai
+    use_tools = tool_capable and intent == "tool"
+
+    # ── Rule-based tool selection (ưu tiên, không phụ thuộc LLM tool-calling) ──
+    if use_tools:
+        excel_count = sum(
+            1 for af in attached_files
+            if (af.filename or "").lower().endswith((".xlsx", ".xls"))
+        )
+        ruled = _select_tool_by_rules(message, excel_count)
+        if ruled:
+            tool_req = {"id": "call_rule", "name": ruled["name"], "arguments": ruled["arguments"]}
+            logger.info(f"Rule-based tool: {ruled['name']} (excel={excel_count})")
+
+            async def emit_tool_rule():
+                yield f"data: __TOOL_REQUEST__{json.dumps(tool_req, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(emit_tool_rule(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     response = None
-    if tool_capable:
+    if use_tools:
         for m in MODELS:
             if not getattr(settings, m["key_attr"], "") or not m["tool_capable"]:
                 continue
@@ -340,18 +632,35 @@ async def agent_chat(
             except Exception as ex:
                 logger.warning(f"{m['id']} failed: {ex}")
     else:
-        # Model không hỗ trợ tool → stream trực tiếp
+        # intent=legal hoặc general → stream trực tiếp, không dùng tool
+        logger.info(f"Stream direct (intent={intent}, tool_capable={tool_capable})")
         async def gen_direct_no_tool():
             s = await client.chat.completions.create(model=llm_model, messages=messages, stream=True)
             async for chunk in s:
                 t = chunk.choices[0].delta.content or ""
                 if t: yield f"data: {t}\n\n"
+            if rag_chunks:
+                citations = format_citations(rag_chunks)
+                yield f"data: __CITATIONS__{json.dumps(citations, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen_direct_no_tool(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     if response is None:
-        raise HTTPException(503, "Tất cả providers không phản hồi")
+        # Tool-calling LLM thất bại hết → trả thông báo thân thiện thay vì 503
+        logger.warning("Tool-detect: tất cả providers fail → thông báo hướng dẫn")
+        async def gen_fallback():
+            msg_txt = (
+                "⚠️ Hiện chưa xác định được loại phân tích phù hợp. "
+                "Vui lòng nêu rõ yêu cầu, ví dụ: *phân tích báo cáo tài chính*, "
+                "*phân tích tuổi nợ*, *đối chiếu ngân hàng*, hoặc *phân tích chênh lệch ngân sách* "
+                "— và đính kèm file Excel tương ứng."
+            )
+            for i in range(0, len(msg_txt), 6):
+                yield f"data: {msg_txt[i:i+6]}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(gen_fallback(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     choice = response.choices[0]
 
@@ -374,6 +683,9 @@ async def agent_chat(
     async def emit_direct():
         for i in range(0, len(direct), 6):
             yield f"data: {direct[i:i+6]}\n\n"
+        if rag_chunks:
+            citations = format_citations(rag_chunks)
+            yield f"data: __CITATIONS__{json.dumps(citations, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
     return StreamingResponse(emit_direct(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

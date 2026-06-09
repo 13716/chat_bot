@@ -163,8 +163,35 @@ export async function streamVariance(
 // ── Agent tool-calling ────────────────────────────────────
 export interface ToolRequest {
   id: string
-  name: "analyze_variance" | "bank_reconciliation"
+  name: "analyze_variance" | "bank_reconciliation" | "analyze_financial_statement" | "ar_ap_aging"
   arguments: Record<string, unknown>
+}
+
+// ── Aging types ────────────────────────────────────────────
+export interface AgingBucketData {
+  label: string
+  count: number
+  amount: number
+  pct: number
+}
+
+export interface AgingVendor {
+  vendor: string
+  total: number
+  buckets: Record<string, number>
+  max_days: number
+  invoice_count: number
+  risk: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+}
+
+export interface AgingSummary {
+  total_outstanding: number
+  invoice_count: number
+  as_of: string
+  buckets: Record<string, AgingBucketData>
+  vendors: AgingVendor[]
+  risk_level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+  risk_reasons: string[]
 }
 
 export interface ModelInfo {
@@ -201,17 +228,56 @@ export async function analyzeFile(file: File): Promise<FileAnalysis | null> {
   } catch { return null }
 }
 
+export interface FSRatio {
+  key: string
+  label: string
+  value: number
+  unit: string
+  status: "good" | "warning" | "critical" | "info"
+  benchmark_good?: number | null
+  benchmark_ok?: number | null
+  dir?: "high_good" | "low_good" | null
+}
+
+export interface VarianceChartItem {
+  item: string
+  budget: number | null
+  actual: number | null
+  variance_abs: number | null
+  variance_pct: number | null
+  line_type: string
+  direction: string
+}
+
 export interface AgentMeta {
   // variance meta
   total_rows?: number
   flagged_count?: number
   threshold?: number
   period?: string | null
+  flagged_items?: VarianceChartItem[]
   // bank recon meta
   summary?: ReconResult["summary"]
   matched_count?: number
   unmatched_bank?: ReconResult["unmatched_bank"]
   unmatched_book?: ReconResult["unmatched_book"]
+  // financial statement meta
+  ratios?: FSRatio[]
+  critical_count?: number
+  warning_count?: number
+  // aging meta (UC#7)
+  aging_summary?: AgingSummary
+  ar_type?: string
+  invoice_count?: number
+}
+
+export interface Citation {
+  source: string
+  article: string
+  article_title: string
+  topic: string
+  score: number
+  label: string
 }
 
 export async function streamAgentChat(params: {
@@ -223,15 +289,17 @@ export async function streamAgentChat(params: {
   onToolRequest: (req: ToolRequest) => void
   onMeta: (meta: AgentMeta) => void
   onToken: (token: string) => void
+  onCitations?: (citations: Citation[]) => void
   onDone: () => void
   pendingTool?: ToolRequest
   varianceFile?: File
   bankFile?: File
   bookFile?: File
+  agingFile?: File
 }) {
   const { message, history, modelId, outputFormat, attachedFiles,
-          onToolRequest, onMeta, onToken, onDone,
-          pendingTool, varianceFile, bankFile, bookFile } = params
+          onToolRequest, onMeta, onToken, onCitations, onDone,
+          pendingTool, varianceFile, bankFile, bookFile, agingFile } = params
 
   const form = new FormData()
   form.append("message", message)
@@ -242,6 +310,7 @@ export async function streamAgentChat(params: {
   if (varianceFile) form.append("variance_file", varianceFile)
   if (bankFile) form.append("bank_file", bankFile)
   if (bookFile) form.append("book_file", bookFile)
+  if (agingFile) form.append("aging_file", agingFile)
   if (attachedFiles) attachedFiles.forEach(f => form.append("attached_files", f))
 
   const res = await fetch(`${BACKEND_URL}/agent/chat`, { method: "POST", body: form })
@@ -267,6 +336,8 @@ export async function streamAgentChat(params: {
         try { onToolRequest(JSON.parse(data.slice("__TOOL_REQUEST__".length))) } catch {}
       } else if (data.startsWith("__META__")) {
         try { onMeta(JSON.parse(data.slice("__META__".length))) } catch {}
+      } else if (data.startsWith("__CITATIONS__")) {
+        try { onCitations?.(JSON.parse(data.slice("__CITATIONS__".length))) } catch {}
       } else if (data) {
         onToken(data)
       }

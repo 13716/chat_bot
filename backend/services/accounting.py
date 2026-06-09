@@ -269,11 +269,69 @@ Yêu cầu:
 # ─────────────────────────────────────────────────────────────
 
 BANK_COLUMN_ALIASES = {
-    "date": ["ngày", "date", "ngày giao dịch", "transaction date", "ngày vd"],
-    "vendor": ["đối tác", "vendor", "tên", "nội dung", "description", "beneficiary", "người thụ hưởng", "nội dung / đối tác"],
-    "amount": ["số tiền", "amount", "tiền", "giá trị", "debit", "credit", "phát sinh"],
-    "ref": ["mã gd", "reference", "ref", "số ct", "transaction id", "mã tham chiếu", "mã gd"],
+    "date": [
+        "ngày", "ngay", "date", "ngày giao dịch", "ngay giao dich",
+        "transaction date", "ngày vd", "ngay vd", "ngày ct", "ngay ct",
+    ],
+    "vendor": [
+        "đối tác", "doi tac", "vendor", "tên", "ten", "nội dung", "noi dung",
+        "description", "beneficiary", "người thụ hưởng", "nguoi thu huong",
+        "nội dung / đối tác", "noi dung / doi tac", "nội dung/đối tác",
+        "noi dung/doi tac", "diễn giải", "dien giai", "người nhận", "nguoi nhan",
+        "tên đối tác", "ten doi tac", "nội dung thanh toán", "noi dung thanh toan",
+    ],
+    "amount": [
+        "số tiền", "so tien", "amount", "tiền", "tien", "giá trị", "gia tri",
+        "debit", "credit", "phát sinh", "phat sinh", "số tiền (vnd)", "so tien (vnd)",
+        "tiền (vnd)", "tien (vnd)", "số tiền vnd", "so tien vnd",
+        "phát sinh nợ", "phat sinh no", "phát sinh có", "phat sinh co",
+    ],
+    "ref": [
+        "mã gd", "ma gd", "reference", "ref", "số ct", "so ct",
+        "transaction id", "mã tham chiếu", "ma tham chieu",
+        "số chứng từ", "so chung tu", "mã giao dịch", "ma giao dich",
+    ],
 }
+
+
+def _norm_col(text: str) -> str:
+    """
+    Chuẩn hóa tên cột để so sánh linh hoạt:
+    - Lowercase
+    - Bỏ khoảng trắng thừa
+    - Bỏ dấu tiếng Việt (dùng unicodedata)
+    """
+    import unicodedata
+    s = str(text).strip().lower()
+    # Bỏ dấu
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    # Normalize dấu câu/khoảng trắng
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _detect_bank_col(col_raw: str) -> Optional[str]:
+    """
+    Map tên cột thực tế → canonical (date/vendor/amount/ref).
+    Thử 3 lớp:
+      1. Exact match (sau khi lowercase + strip dấu)
+      2. Alias là substring của cột (VD: cột "Số tiền (VND)" chứa "so tien")
+      3. Cột là substring của alias (VD: cột "tiền" nằm trong alias "so tien")
+    """
+    normed = _norm_col(col_raw)
+    for canonical, aliases in BANK_COLUMN_ALIASES.items():
+        normed_aliases = [_norm_col(a) for a in aliases]
+        # Lớp 1: exact
+        if normed in normed_aliases:
+            return canonical
+        # Lớp 2: alias is substring of col
+        if any(a in normed for a in normed_aliases):
+            return canonical
+        # Lớp 3: col is substring of alias
+        if any(normed in a for a in normed_aliases if len(normed) >= 3):
+            return canonical
+    return None
 
 
 def normalize_vendor_name(name: str) -> str:
@@ -313,23 +371,44 @@ def parse_excel_bank(
     if df.empty:
         return [], ValidationResult(False, [ValidationError("file", "File không có dữ liệu")])
 
-    # Auto-detect cột
+    # Bỏ cột Unnamed
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    # Auto-detect cột (3 lớp: exact, substring, reverse-substring)
     rename_map: dict[str, str] = {}
     for col in df.columns:
-        cleaned = str(col).strip().lower()
-        for canonical, aliases in BANK_COLUMN_ALIASES.items():
-            if cleaned in aliases:
-                rename_map[col] = canonical
-                break
+        canonical = _detect_bank_col(str(col))
+        if canonical and canonical not in rename_map.values():
+            rename_map[col] = canonical
 
     df = df.rename(columns=rename_map)
+
+    # Fallback: nếu vẫn thiếu "vendor" → dùng cột text đầu tiên chưa được map
+    if "vendor" not in df.columns:
+        mapped = set(rename_map.values())
+        for col in df.columns:
+            if col not in mapped and df[col].dtype == object:
+                df = df.rename(columns={col: "vendor"})
+                break
+
+    # Fallback: nếu vẫn thiếu "amount" → dùng cột số đầu tiên chưa được map
+    if "amount" not in df.columns:
+        mapped = set(df.columns) - {"vendor", "date", "ref"}
+        for col in df.columns:
+            if col in mapped and pd.api.types.is_numeric_dtype(df[col]):
+                df = df.rename(columns={col: "amount"})
+                break
 
     required = ["vendor", "amount"]
     missing = [c for c in required if c not in df.columns]
     if missing:
+        cols_found = list(df.columns)
         return [], ValidationResult(
             False,
-            [ValidationError("columns", f"Thiếu cột: {', '.join(missing)}")]
+            [ValidationError("columns",
+                f"Không nhận dạng được cột {', '.join(missing)}. "
+                f"Các cột trong file: {cols_found}. "
+                f"Cần có cột tên vendor/đối tác và số tiền.")]
         )
 
     rows: list[dict] = []
