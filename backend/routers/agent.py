@@ -544,14 +544,22 @@ async def agent_chat(
     rag_chunks: list[dict] = []
     intent = detect_intent(message)
 
-    # File Excel đính kèm → ép intent=tool, NHƯNG chỉ khi câu hỏi mơ hồ (general).
-    # Tôn trọng phân loại rõ ràng:
-    #   - intent=legal (vd "đúng pháp lý chưa", "theo thông tư") → giữ RAG, KHÔNG ép
-    #   - intent=tool  (vd "phân tích báo cáo tài chính")        → vốn đã là tool
+    # File Excel đính kèm → ép intent=tool (chạy phân tích), TRỪ KHI câu hỏi là
+    # CÂU HỎI TUÂN THỦ PHÁP LÝ rõ ràng (giữ RAG). Lý do dùng marker thay vì intent:
+    #   - "phân tích FILE báo cáo tài chính" bị detect_intent xếp nhầm legal vì có
+    #     "báo cáo tài chính", nhưng thực chất là yêu cầu PHÂN TÍCH → phải chạy tool.
+    #   - "báo cáo tài chính này đúng pháp lý chưa" → có marker tuân thủ → giữ RAG.
     # File Word/PDF KHÔNG ép → giữ guard tóm tắt cũ.
+    _COMPLIANCE_MARKERS = [
+        "phap ly", "tu phap", "phap luat", "hop phap", "tuan thu", "hop le",
+        "hop quy", "dung luat", "dung quy dinh", "dung chuan", "dung thong tu",
+        "theo thong tu", "theo quy dinh", "theo chuan muc", "vi pham", "co dung phap",
+    ]
     has_excel = any((af.filename or "").lower().endswith((".xlsx", ".xls")) for af in attached_files)
-    if has_excel and tool_capable and intent == "general":
-        logger.info("Excel đính kèm + câu mơ hồ → ép intent='tool'")
+    is_compliance_q = any(m in _norm_msg(message) for m in _COMPLIANCE_MARKERS)
+    if has_excel and tool_capable and not is_compliance_q:
+        if intent != "tool":
+            logger.info(f"Excel + không phải câu tuân thủ → ép intent '{intent}'→'tool'")
         intent = "tool"
 
     if intent == "legal":

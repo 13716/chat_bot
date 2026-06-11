@@ -298,8 +298,12 @@ export default function AgentChatWindow() {
 
   // ── Core: gọi tool với file cụ thể ──────────────────────────────────────
 
-  const runTool = async (req: ToolRequest, vf?: File, bf?: File, bkf?: File, agf?: File) => {
-    const orig = messages.find(m => m.role === "user")?.content ?? ""
+  const runTool = async (req: ToolRequest, message: string, vf?: File, bf?: File, bkf?: File, agf?: File) => {
+    // Dùng message truyền vào (tránh stale closure của `messages` ở hội thoại mới
+    // → tránh gửi message="" gây FastAPI 422 "Field required").
+    const orig = (message ?? "").trim()
+      || messages.find(m => m.role === "user")?.content?.trim()
+      || "phân tích file đính kèm"
     const names = [vf, bf, bkf, agf].filter(Boolean).map(f => f!.name).join(", ")
     if (names) setMessages(prev => [...prev, { role: "user", content: `📎 ${names}` }])
 
@@ -372,7 +376,7 @@ export default function AgentChatWindow() {
           setMessages(prev => [...prev, {
             role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
           }])
-          await runTool(req, excelFiles[0])
+          await runTool(req, content, excelFiles[0])
           return
         }
         // analyze_variance: 1 Excel
@@ -380,7 +384,7 @@ export default function AgentChatWindow() {
           setMessages(prev => [...prev, {
             role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
           }])
-          await runTool(req, excelFiles[0])
+          await runTool(req, content, excelFiles[0])
           return
         }
         // bank_reconciliation: 2 Excel
@@ -388,7 +392,7 @@ export default function AgentChatWindow() {
           setMessages(prev => [...prev, {
             role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
           }])
-          await runTool(req, undefined, excelFiles[0], excelFiles[1])
+          await runTool(req, content, undefined, excelFiles[0], excelFiles[1])
           return
         }
         // ar_ap_aging: 1 Excel
@@ -396,7 +400,7 @@ export default function AgentChatWindow() {
           setMessages(prev => [...prev, {
             role: "tool_prompt", content: TOOL_LABELS[req.name], toolReq: req,
           }])
-          await runTool(req, undefined, undefined, undefined, excelFiles[0])
+          await runTool(req, content, undefined, undefined, undefined, excelFiles[0])
           return
         }
 
@@ -444,6 +448,7 @@ export default function AgentChatWindow() {
   const executeTool = async () => {
     if (!pendingTool) return
     setLoading(true)
+    const origMsg = messages.find(m => m.role === "user")?.content ?? "phân tích file đính kèm"
     const vf  = varianceFileRef.current?.files?.[0]
     const bf  = bankFileRef.current?.files?.[0]
     const bkf = bookFileRef.current?.files?.[0]
@@ -465,7 +470,7 @@ export default function AgentChatWindow() {
       setMessages(prev => [...prev, { role: "assistant", content: "⚠️ Vui lòng chọn file Excel danh sách công nợ." }])
       setLoading(false); return
     }
-    await runTool(pendingTool, vf, bf, bkf, agf)
+    await runTool(pendingTool, origMsg, vf, bf, bkf, agf)
   }
 
   const currentModel = models.find(m => m.id === selectedModel)
